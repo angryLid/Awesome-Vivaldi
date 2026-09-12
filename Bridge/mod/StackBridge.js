@@ -24,11 +24,12 @@
   "use strict";
 
   const LOG = "[StackBridge]";
-  const MOD_VERSION = "2026.9.12-r3"; // runtime build identity (date segment matches @version)
+  const MOD_VERSION = "2026.9.12-r4"; // runtime build identity (date segment matches @version)
   const PROTOCOL_VERSION = 1;
   const EVENT_DEBOUNCE_MS = 150;
   const MAX_NAME_LEN = 50; // Vivaldi caps fixed titles at 50 chars (PageActions.setFixedTitle)
   const MAX_TABS_PER_CALL = 200;
+  const MOVE_SETTLE_MS = 100; // settle between structural moves and metadata reads (mirrors TidyTabs)
 
   // Two-level logging: DEBUG traces requests/responses/event fan-out, ERROR reports failures and always prints; the dev build ships with DEBUG on.
   const LEVELS = { DEBUG: 10, ERROR: 20 };
@@ -103,6 +104,8 @@
   // Compact one-line preview of a value for log lines (truncated, never throws).
   const short = (v) => { try { const s = JSON.stringify(v) ?? String(v); return s.length > 120 ? `${s.slice(0, 117)}…` : s; } catch { return "[unserializable]"; } };
 
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
   // ── stack state assembly (read path) ───────────────────────────────────
 
   const buildStacks = (tabs) => {
@@ -172,28 +175,47 @@
     await callPrivate(tp().setGroupProperties.bind(tp()), { groupExtId: String(groupId), groupColor: color }, "tabsPrivate.setGroupProperties");
   };
 
-  // Best-effort vivExtData refresh — fire-and-forget. Native stacking already writes `group` into
-  // member tabs and setGroupProperties propagates the title, so this is redundant belt-and-suspenders;
-  // chrome.tabs.* callbacks are not trusted to fire in the UI context, so never await them.
-  const writeGroupMeta = (tabIds, groupId, name) => {
-    for (const tabId of tabIds) {
+  // Serial, awaited vivExtData touch-up for one tab: read fresh, apply mutate, write back only
+  // when something actually differs. chrome.tabs.get/update callbacks ARE reliable in the
+  // window.html context — only chrome.tabs.move's callback proved untrustworthy — and TidyTabs
+  // runs this exact pattern awaited. When native already wrote the right data the update is
+  // skipped entirely, so the common case costs zero writes and zero race surface.
+  const updateTabMeta = (tabId, mutate) =>
+    new Promise((resolve) => {
       chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError || !tab) return;
+        if (chrome.runtime.lastError || !tab) return resolve();
         const v = parseViv(tab);
+        const before = JSON.stringify(v);
+        mutate(v);
+        if (JSON.stringify(v) === before) return resolve();
+        logDebug(`vivExtData: writing tab ${tabId} → ${short(v)}`);
+        chrome.tabs.update(tabId, { vivExtData: JSON.stringify(v) }, () => { void chrome.runtime.lastError; resolve(); });
+      });
+    });
+
+  // Post-move metadata refresh — serial and awaited, one tab at a time. This used to be
+  // concurrent fire-and-forget (r3) and that raced Vivaldi's own post-move vivExtData commit:
+  // stale get() snapshots were written back over fresh native data, desyncing member metadata
+  // from the UI model — first click inside the stack jumped and reverted, and a tab could
+  // escape its group. TidyTabs avoids the bug by strictly serializing the same writes.
+  const writeGroupMeta = async (tabIds, groupId, name) => {
+    for (const tabId of tabIds) {
+      await updateTabMeta(tabId, (v) => {
         v.group = String(groupId);
         if (name) v.fixedGroupTitle = name;
-        chrome.tabs.update(tabId, { vivExtData: JSON.stringify(v) }, () => void chrome.runtime.lastError);
       });
     }
   };
 
-  // Shared mutation choreography: native group → title/color → fire-and-forget metadata refresh.
+  // Shared mutation choreography: native group → settle → title/color → serial metadata refresh.
   const groupTabs = async (orderedTabs, { name, color }) => {
     const ids = orderedTabs.map((t) => t.id);
     const groupId = await rebuildGroup(ids, ids[0]);
+    // Let Vivaldi finish its own post-move vivExtData commit before we read anything back.
+    await wait(MOVE_SETTLE_MS);
     await setGroupTitle(groupId, name);
     await setGroupColor(groupId, color);
-    writeGroupMeta(ids, groupId, name);
+    await writeGroupMeta(ids, groupId, name);
     return { groupExtId: groupId };
   };
 
@@ -250,13 +272,10 @@
       if (!hasUnstack()) throw err("UNSUPPORTED_API", "tabsPrivate.unstack unavailable");
       const lastId = remaining[0].id;
       await dissolveStack(stackId);
-      // Best-effort metadata cleanup on the leftover tab — fire-and-forget (see writeGroupMeta).
-      chrome.tabs.get(lastId, (tab) => {
-        if (chrome.runtime.lastError || !tab) return;
-        const v = parseViv(tab);
+      // Metadata cleanup on the leftover tab — awaited, skipped when native already cleared it.
+      await updateTabMeta(lastId, (v) => {
         delete v.group;
         delete v.fixedGroupTitle;
-        chrome.tabs.update(lastId, { vivExtData: JSON.stringify(v) }, () => void chrome.runtime.lastError);
       });
       return { unstacked: true };
     }
@@ -268,14 +287,16 @@
     if (!stackId) throw err("BAD_PARAMS", "stackId is required");
     if (!hasUnstack()) throw err("UNSUPPORTED_API", "tabsPrivate.unstack unavailable");
     await dissolveStack(stackId);
-    // Best-effort metadata cleanup for former members — fire-and-forget (see writeGroupMeta).
+    // Settle, then serial awaited cleanup for former members — skipped when already cleared.
+    await wait(MOVE_SETTLE_MS);
     const tabs = await queryTabs();
     for (const t of tabs) {
       const v = parseViv(t);
       if (v.group === String(stackId) || v.tidyStackId === String(stackId)) {
-        delete v.group;
-        delete v.fixedGroupTitle;
-        chrome.tabs.update(t.id, { vivExtData: JSON.stringify(v) }, () => void chrome.runtime.lastError);
+        await updateTabMeta(t.id, (x) => {
+          delete x.group;
+          delete x.fixedGroupTitle;
+        });
       }
     }
     return { unstacked: true };
@@ -287,10 +308,8 @@
     await setGroupTitle(stackId, clampName(name));
     const tabs = await queryTabs();
     for (const t of tabs) {
-      const v = parseViv(t);
-      if (v.group === String(stackId)) {
-        v.fixedGroupTitle = clampName(name);
-        chrome.tabs.update(t.id, { vivExtData: JSON.stringify(v) }, () => void chrome.runtime.lastError);
+      if (parseViv(t).group === String(stackId)) {
+        await updateTabMeta(t.id, (x) => { x.fixedGroupTitle = clampName(name); });
       }
     }
     return { ok: true };
