@@ -48,7 +48,9 @@ In the current build these commands exist but are **no-ops** (they log a DEBUG n
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
+  "versions": [1, 2],
+  "deprecatedActions": ["stacks.create"],
   "nativeStacking": true,
   "groupTitle": true,
   "groupColor": true,
@@ -57,6 +59,7 @@ In the current build these commands exist but are **no-ops** (they log a DEBUG n
   "actions": ["bridge.ping", "bridge.capabilities", "tabs.list", "stacks.list",
               "stacks.create", "stacks.addTabs", "stacks.removeTabs",
               "stacks.rename", "stacks.setColor", "stacks.unstack", "stacks.pin",
+              "layout.apply",
               "events.subscribe", "events.unsubscribe"]
 }
 ```
@@ -130,7 +133,7 @@ Events are **debounced full snapshots** (150 ms after the last tab change), not 
 }
 ```
 
-A stack exists when ≥ 2 tabs share a `group` value in their `vivExtData`. Unnamed stacks are included with `name: ""`.
+A stack entry appears for every distinct non-empty `group` value, including `tabCount: 1` remnants (a stack whose members left — treat them as cleanup candidates). Grouping flows in the bridge require ≥ 2 members. Unnamed stacks are included with `name: ""`.
 
 ### 3.2 Tab
 
@@ -166,6 +169,8 @@ Params: `{ windowId?: number }` (omit = current window).
 
 #### `stacks.create`
 
+> **Deprecated.** Superseded by `layout.apply` (§4b) and retained only as a v1 rollback surface (`bridge.capabilities` reports it under `deprecatedActions`). New integrations should declare end-state layouts instead.
+
 Create a native stack from 2+ tabs.
 
 | Param | Type | Required | Notes |
@@ -190,7 +195,7 @@ Returns `{ "groupExtId": "..." }`. Errors: `NO_SUCH_STACK`, `TOO_FEW_TABS`, `PIN
 
 #### `stacks.removeTabs`
 
-Remove tabs from a stack. If fewer than 2 tabs remain, the stack is dissolved (`tabsPrivate.unstack`) and group metadata is cleared.
+Remove tabs from a stack. If fewer than 2 tabs remain, the stack is dissolved (`tabsPrivate.unstack`) and group metadata is cleared. If rebuilding the remainder would require moving pinned members, the call fails with `PINNED_TABS`; if only pinned members remain, the stack is dissolved in place (no tab is moved). The rebuilt stack keeps the source stack's title.
 
 | Param | Type | Required | Notes |
 |---|---|---|---|
@@ -205,7 +210,7 @@ Rename a stack (native title + `vivExtData` bookkeeping). Param: `{ stackId: str
 
 #### `stacks.setColor`
 
-Set the native stack color. Param: `{ stackId: string, color: string }`. Requires `groupColor` capability. Returns `{ "ok": true }`.
+Set the native stack color. Param: `{ stackId: string, color: string }`. Requires `groupColor` capability. The color is also written into every member's `vivExtData` (mirroring `stacks.rename`), so bridge-set colors survive session restore. Returns `{ "ok": true }`.
 
 #### `stacks.unstack`
 
@@ -234,7 +239,8 @@ The external extension declares the **entire desired end-state**; the bridge com
 {
   "groups": [
     { "name": "V2EX", "color": "color1", "tabIds": [101, 102] },
-    { "tabIds": [103, 104] }            // name/color optional
+    { "tabIds": [103, 104] },            // name/color optional
+    { "name": "Others", "tabIds": [106, 107], "position": "end" }  // optional: walk the group to the strip tail after apply
   ],
   "ungrouped": [105]                     // optional: tabs that must end up unstacked
 }
@@ -242,12 +248,13 @@ The external extension declares the **entire desired end-state**; the bridge com
 
 Orchestration (all under one mutation lock and watchdog):
 
-1. **Plan** — one snapshot; unresolvable/pinned/duplicate/over-claimed tabs are reported in `skipped` (reasons: `NOT_IN_WINDOW`, `PINNED`, `ALREADY_CLAIMED`, `GROUP_TOO_SMALL`) instead of failing the call.
+1. **Plan** — one snapshot; unresolvable/pinned/duplicate/over-claimed tabs are reported in `skipped` (reasons: `NOT_IN_WINDOW`, `PINNED`, `PANEL_TAB`, `CROSS_WORKSPACE`, `ALREADY_CLAIMED`, `GROUP_TOO_SMALL`) instead of failing the call.
 2. **Reconcile existing stacks** (TidyTabs' dismantle step) — stacks losing members to a target or to `ungrouped` are rebuilt with the remainder (full pipeline, title preserved) or dissolved when they drop below two members.
 3. **Realize targets left-to-right** by anchor position — strip-order adjacency pre-pass → native move with contiguous strip-ordered ids → settle → `setGroupProperties` → per-member tree metadata. Members already in one stack get a fresh group ext id (TidyTabs' addTabs behavior) with the clean-slate audit dissolving the old group.
-4. **Idempotency** — a target whose members already sit together in one stack under the requested title/color is reported with `"unchanged": true` and left untouched. Re-sending the same layout is a no-op; after any partial failure, re-sending it converges (self-healing).
+4. **Idempotency** — a target whose members already sit together in one stack under the requested title/color (and at the strip tail when `position: "end"`) is reported with `"unchanged": true` and left untouched. Re-sending the same layout is a no-op; after any partial failure, re-sending it converges (self-healing).
+5. **Positional pass** — groups marked `"position": "end"` are walked to the strip tail in declaration order, inside the mutation lock; no client-side strip mutation is ever needed.
 
-`rev` increments per successful apply (per mod session). Errors: `BAD_PARAMS`, `GROUPED_TABS` (unreachable in practice — phase 1 dissolves conflicts first), `UNSUPPORTED_API`, watchdog errors.
+`rev` increments per successful apply (per mod session). Errors: `BAD_PARAMS`, `NAMED_STACK_CONFLICT` (a plan target renames a named stack its members still belong to — Phase 1 dissolves such stacks first, so this is unreachable in practice), `ADJACENCY_FAILED`, `UNSUPPORTED_API`, watchdog errors.
 
 v1 clients are unaffected; `layout.apply` on a `v: 1` envelope returns `WRONG_VERSION`.
 
@@ -265,6 +272,9 @@ v1 clients are unaffected; `layout.apply` on a `v: 1` envelope returns `WRONG_VE
 | `WRONG_VERSION` | v2-only action called on a v1 envelope | Send the request with `"v": 2` |
 | `BUSY` | Another mutation in flight | Retry after a short delay |
 | `STACKING_FAILED` | `tabsPrivate.move` returned no group id | Check capabilities; report upstream |
+| `ADJACENCY_FAILED` | Members could not be made contiguous in strip order within two passes — the native group move was **not** attempted (fail-closed) | Retry once; if it persists, report the Vivaldi version |
+| `NAMED_STACK_CONFLICT` | Operation would dissolve a named stack under a different (or no) title | Use `layout.apply` (explicit continuation) or `stacks.removeTabs` |
+| `CROSS_WORKSPACE` | Tabs belong to a different workspace than the target stack / current workspace | Scope the operation to one workspace |
 | `NATIVE_TIMEOUT` | A private Vivaldi API call never responded (10 s watchdog) | Retry once; if it repeats, report the Vivaldi version |
 | `MUTATION_TIMEOUT` | A stack mutation exceeded the 30 s overall bound (watchdog) | Retry once; if it repeats, report the Vivaldi version and the console log |
 | `INTERNAL` | Unexpected error | See `message`; window.html console has details |
@@ -276,6 +286,7 @@ Note: `BRIDGE_TIMEOUT` and `BAD_RESPONSE` come from the client helper (§2.2), n
 - **UI updates are automatic.** Writes go through Vivaldi's native write path; the tab bar re-renders on its own. Never try to notify the UI yourself.
 - **Mutations are serialized.** Concurrent write requests get `BUSY`. Read actions are never blocked.
 - **Member order follows the tab strip, not `tabIds` order.** `tabIds` selects WHICH tabs are grouped; the resulting group order is their current strip order (TidyTabs/Vivaldi-UI-aligned). Tabs are pre-placed contiguously in strip order before the native group move, so the move never reorders inside the contiguous run — the native flow the Vivaldi UI itself exercises. Sort `tabIds` before sending if the caller needs to know the resulting order.
+- **Operations are workspace-local.** Write paths resolve members against the current workspace (derived from the active tab, TidyTabs semantics). `stacks.create` silently excludes tabs of other workspaces; `layout.apply` reports them as `skipped` with reason `CROSS_WORKSPACE`; `stacks.addTabs` rejects them. Panel tabs (`vivExtData.panelId`) are never moved into stacks (`PANEL_TAB` in `layout.apply`, silently excluded elsewhere).
 - **Names are capped at 50 characters** (Vivaldi's own limit for fixed titles); longer names are silently truncated.
 - **Stack state is window-scoped in v1.** Omitting `windowId` operates on the current window.
 - **Uninstall safety.** `bridge.sh uninstall` removes only the bridge mod. Stack state (`vivExtData`) is part of tab metadata and survives; the native stacks remain fully functional without the mod.

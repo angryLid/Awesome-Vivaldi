@@ -24,7 +24,7 @@
   "use strict";
 
   const LOG = "[StackBridge]";
-  const MOD_VERSION = "2026.9.12-r8"; // runtime build identity (date segment matches @version)
+  const MOD_VERSION = "2026.9.12-r9"; // runtime build identity (date segment matches @version)
   const PROTOCOL_VERSION = 2;
   const PROTOCOL_VERSIONS = [1, 2]; // v1 actions stay fully served; v2 adds layout.apply
   const EVENT_DEBOUNCE_MS = 150;
@@ -72,6 +72,13 @@
       return typeof tab.vivExtData === "string" ? JSON.parse(tab.vivExtData) : (tab.vivExtData || {});
     } catch { return {}; }
   };
+
+  // Workspace scoping (TidyTabs parity): operations are workspace-local. The operation's workspace is derived from the active tab of the current window; tabs without a workspaceId belong to the default workspace and match only when no workspace is active.
+  const resolveWorkspace = (tabs) => {
+    const active = tabs.find((t) => t.active && t.id > 0);
+    return active ? (parseViv(active).workspaceId ?? null) : null;
+  };
+  const inWorkspace = (t, ws) => (parseViv(t).workspaceId ?? null) === ws;
 
   // Vivaldi 8 exposes tabsPrivate.* as promise-based functions — its own UI bundle only ever awaits them and never passes a callback (Others/Reverse/bundle/modules/59322.js). A callback-style call wedged silently on a real 8.x install: the browser never responds, the promise never settles and the mutation lock leaks. Call promise-style first; the callback form is only a fallback for old callback-era bindings.
   const NATIVE_CALL_TIMEOUT_MS = 10000; // a non-responding native call must not hold the mutation lock forever
@@ -201,12 +208,17 @@
   // exercises, and the latent tree corruption behind the delayed stack desync. Group member
   // order therefore follows the strip, matching what TidyTabs produces. Contiguity is
   // verified through the trusted read path (chrome.tabs.query) and retried once; correctness
-  // never depends on move callbacks. Returns the members in strip order.
+  // never depends on move callbacks. Fail-closed: if contiguity cannot be verified after two
+  // passes, the function throws ADJACENCY_FAILED instead of proceeding — handing unverified
+  // input to the native group move would re-create the reorder-inside-run hazard described
+  // above. Callers recover by re-issuing the request (layout.apply is self-healing by design).
   const makeAdjacent = async (orderedTabs) => {
     const byStrip = [...orderedTabs].sort((a, b) => a.index - b.index);
     for (let pass = 1; pass <= 2; pass++) {
       const before = await queryTabs();
-      const base = before.find((t) => t.id === byStrip[0].id)?.index ?? 0;
+      const anchor = before.find((t) => t.id === byStrip[0].id);
+      if (!anchor) throw err("ADJACENCY_FAILED", "Anchor tab disappeared during adjacency pre-pass");
+      const base = anchor.index;
       for (let i = 0; i < byStrip.length; i++) await moveTabRace(byStrip[i].id, base + i);
       await wait(MOVE_SETTLE_MS);
       const after = await queryTabs();
@@ -217,8 +229,7 @@
       }
       logDebug(`adjacency pass ${pass}: members not contiguous yet, retrying`);
     }
-    logDebug("adjacency: verification inconclusive, proceeding with the native move anyway");
-    return byStrip;
+    throw err("ADJACENCY_FAILED", "Members could not be made contiguous in strip order after 2 passes");
   };
 
   // Serial, awaited vivExtData touch-up for one tab: read fresh, apply mutate, write back only
@@ -237,6 +248,16 @@
         logDebug(`vivExtData: writing tab ${tabId} → ${short(v)}`);
         chrome.tabs.update(tabId, { vivExtData: JSON.stringify(v) }, () => { void chrome.runtime.lastError; resolve(); });
       });
+    });
+
+  // Clear all bridge-owned stack fields from a tab's vivExtData — skipped entirely when native already cleared them.
+  const clearStackMeta = (tabId) =>
+    updateTabMeta(tabId, (x) => {
+      delete x.group;
+      delete x.fixedGroupTitle;
+      delete x.tidyStackId;
+      delete x.tidyStackOwner;
+      delete x.groupColor;
     });
 
   // TidyTabs-exact metadata write: unconditional update followed by a verification read.
@@ -290,7 +311,7 @@
   // adjacency pre-pass (single converging pass) → native group move receives strip-ordered
   // contiguous ids (no internal reordering) → settle → title/color → per-member tree
   // metadata written sequentially with pacing.
-  const groupTabs = async (orderedTabs, { name, color }) => {
+  const groupTabs = async (orderedTabs, { name, color } = {}) => {
     // Clean-slate invariant (TidyTabs-aligned): TidyTabs never runs create-new-group over
     // tabs still registered in another stack — it dismantles unnamed stacks first and
     // excludes named-stack members from its pool. Create-new-group over model-registered
@@ -298,8 +319,13 @@
     // suppressed by do-not-reparent), and the resulting dual membership is what gets
     // normalized later — surfacing as delayed first-click desyncs and members escaping to
     // other groups. Dissolve a single shared old group automatically; refuse on mixed ones.
+    // Name-aware (TidyTabs preserve-named semantics): a NAMED old group is only dissolved when the rebuild carries the same title — rebuilding under a different or no title throws NAMED_STACK_CONFLICT instead of silently destroying the user's stack name.
     const oldGroups = [...new Set(orderedTabs.map((t) => String(parseViv(t).group || "")).filter(Boolean))];
     if (oldGroups.length === 1) {
+      const oldName = orderedTabs.map((t) => parseViv(t)).find((v) => String(v.group || "") === oldGroups[0])?.fixedGroupTitle || "";
+      if (oldName && oldName !== (name || "")) {
+        throw err("NAMED_STACK_CONFLICT", `Members belong to named stack "${oldName}" — move them via layout.apply or stacks.removeTabs first`);
+      }
       logDebug(`stack mutation: members belong to stack ${oldGroups[0]} — dissolving it first (clean slate)`);
       await dissolveStack(oldGroups[0]);
     } else if (oldGroups.length > 1) {
@@ -328,9 +354,13 @@
     if (!hasPrivate()) throw err("UNSUPPORTED_API", "tabsPrivate.move unavailable — native stacking not possible");
     const ids = validateTabIds(tabIds);
     const tabs = await queryTabs();
+    const ws = await resolveWorkspace(tabs);
     const byId = new Map(tabs.map((t) => [t.id, t]));
-    const moving = ids.map((id) => byId.get(id)).filter(Boolean);
-    logDebug(`stacks.create: ${moving.length}/${ids.length} tabs resolved in current window`);
+    const resolved = ids.map((id) => byId.get(id)).filter(Boolean);
+    if (resolved.some((t) => t.pinned)) throw err("PINNED_TABS", "Cannot group pinned tabs (Vivaldi restriction)");
+    // Panel tabs and tabs of other workspaces are outside the write scope — excluded, not fatal (TidyTabs skips unsuitable tabs the same way).
+    const moving = resolved.filter((t) => !parseViv(t).panelId && inWorkspace(t, ws));
+    logDebug(`stacks.create: ${moving.length}/${ids.length} tabs resolved in the current workspace`);
     if (moving.length < 2) throw err("TOO_FEW_TABS", "At least 2 valid tab ids are required");
     if (moving.some((t) => t.pinned)) throw err("PINNED_TABS", "Cannot group pinned tabs (Vivaldi restriction)");
     return groupTabs(moving, { name: clampName(name), color });
@@ -345,15 +375,29 @@
     const byId = new Map(tabs.map((t) => [t.id, t]));
     const vivOf = (t) => parseViv(t);
     const existing = tabs.filter((t) => vivOf(t).group === String(stackId) && !ids.includes(t.id));
-    const moving = ids.map((id) => byId.get(id)).filter(Boolean);
+    // Write eligibility applies to the moving tabs only — existing members are reported as they are.
+    const moving = ids.map((id) => byId.get(id)).filter((t) => t && !t.pinned && !vivOf(t).panelId);
     if (!existing.length && !moving.length) throw err("NO_SUCH_STACK", `No tabs found for stack ${stackId}`);
     if (moving.some((t) => t.pinned) && existing.some((t) => !t.pinned)) throw err("PINNED_TABS", "Cannot add pinned tabs to an unpinned stack");
+    // Workspace consistency: the target stack lives in one workspace; movers from another are rejected rather than silently clipped.
+    const ws = existing.length ? (vivOf(existing[0]).workspaceId ?? null) : await resolveWorkspace(tabs);
+    if (moving.some((t) => !inWorkspace(t, ws))) throw err("CROSS_WORKSPACE", "Tabs to add belong to a different workspace than the target stack");
     const members = [...existing, ...moving];
     if (members.length < 2) throw err("TOO_FEW_TABS", "Resulting stack would have fewer than 2 tabs");
     // effective name: explicit param wins, else inherit from any existing named member
     const effectiveName = name !== undefined
       ? clampName(name)
       : (existing.map((t) => vivOf(t).fixedGroupTitle).find(Boolean) || "");
+    // TidyTabs-exact placement: new tabs go right after the last existing member, so the rebuilt group keeps them at the END of the stack regardless of where they sat before; the strip-order pre-pass inside groupTabs then converges with the new tabs already at the tail.
+    const lastExisting = existing[existing.length - 1];
+    if (lastExisting && moving.length) {
+      const snap = await queryTabs();
+      const base = snap.find((t) => t.id === lastExisting.id)?.index;
+      if (base !== undefined) {
+        for (let i = 0; i < moving.length; i++) await moveTabRace(moving[i].id, base + 1 + i);
+        await wait(MOVE_SETTLE_MS);
+      }
+    }
     return groupTabs(members, { name: effectiveName });
   };
 
@@ -369,14 +413,21 @@
       if (!hasUnstack()) throw err("UNSUPPORTED_API", "tabsPrivate.unstack unavailable");
       const lastId = remaining[0].id;
       await dissolveStack(stackId);
-      // Metadata cleanup on the leftover tab — awaited, skipped when native already cleared it.
-      await updateTabMeta(lastId, (v) => {
-        delete v.group;
-        delete v.fixedGroupTitle;
-      });
+      await clearStackMeta(lastId);
       return { unstacked: true };
     }
-    return groupTabs(remaining, {});
+    // Never move pinned members: a mixed remainder cannot be rebuilt (PINNED_TABS), an all-pinned remainder is dissolved in place — native unstack clears membership without reordering.
+    const unpinned = remaining.filter((t) => !t.pinned);
+    if (unpinned.length && unpinned.length < remaining.length) throw err("PINNED_TABS", "Rebuilding this stack would move its pinned members — unstack instead");
+    if (!unpinned.length) {
+      await dissolveStack(stackId);
+      await wait(MOVE_SETTLE_MS);
+      for (const t of remaining) await clearStackMeta(t.id);
+      return { unstacked: true };
+    }
+    // Preserve the stack's own title across the rebuild — also required to pass the name-aware clean-slate audit in groupTabs.
+    const inheritedName = remaining.map((t) => parseViv(t).fixedGroupTitle).find(Boolean) || undefined;
+    return groupTabs(unpinned, { name: inheritedName });
   };
 
   // stacks.unstack — dissolve an entire stack
@@ -389,12 +440,7 @@
     const tabs = await queryTabs();
     for (const t of tabs) {
       const v = parseViv(t);
-      if (v.group === String(stackId) || v.tidyStackId === String(stackId)) {
-        await updateTabMeta(t.id, (x) => {
-          delete x.group;
-          delete x.fixedGroupTitle;
-        });
-      }
+      if (v.group === String(stackId) || v.tidyStackId === String(stackId)) await clearStackMeta(t.id);
     }
     return { unstacked: true };
   };
@@ -415,6 +461,11 @@
   const colorStack = async ({ stackId, color } = {}) => {
     if (!stackId) throw err("BAD_PARAMS", "stackId is required");
     await setGroupColor(stackId, color);
+    // Mirror renameStack: per-member vivExtData bookkeeping so bridge-set colors survive session restore (updateTabMeta skips already-correct members).
+    const tabs = await queryTabs();
+    for (const t of tabs) {
+      if (parseViv(t).group === String(stackId)) await updateTabMeta(t.id, (x) => { x.groupColor = color; });
+    }
     return { ok: true };
   };
 
@@ -444,6 +495,7 @@
     return {
       protocol: PROTOCOL_VERSION,
       versions: PROTOCOL_VERSIONS,
+      deprecatedActions: ["stacks.create"],
       nativeStacking: hasPrivate(),
       groupTitle: hasSetGroupProperties(),
       groupColor: hasSetGroupProperties(),
@@ -497,6 +549,7 @@
     // touching anything. Unresolvable/pinned/over-claimed tabs are reported, not fatal —
     // TidyTabs skips unsuitable tabs the same way.
     const tabs = await queryTabs();
+    const ws = await resolveWorkspace(tabs);
     const byId = new Map(tabs.map((t) => [t.id, t]));
     const skipped = [];
     const claimed = new Map(); // tabId → target
@@ -504,12 +557,15 @@
       const t = byId.get(Number(id));
       if (!t) { skipped.push({ tabId: id, reason: "NOT_IN_WINDOW" }); return null; }
       if (t.pinned) { skipped.push({ tabId: id, reason: "PINNED" }); return null; }
+      if (parseViv(t).panelId) { skipped.push({ tabId: t.id, reason: "PANEL_TAB" }); return null; }
+      if (!inWorkspace(t, ws)) { skipped.push({ tabId: t.id, reason: "CROSS_WORKSPACE" }); return null; }
       if (claimed.has(t.id)) { skipped.push({ tabId: t.id, reason: "ALREADY_CLAIMED" }); return null; }
       return t;
     };
     const targets = [];
     for (const g of groups) {
       if (!g || !Array.isArray(g.tabIds)) throw err("BAD_PARAMS", "each group needs a tabIds array");
+      if (g.position !== undefined && g.position !== "end") throw err("BAD_PARAMS", 'group.position must be "end" or omitted');
       const name = clampName(g.name);
       const members = [];
       for (const id of g.tabIds) {
@@ -521,7 +577,7 @@
         skipped.push({ group: name || null, reason: "GROUP_TOO_SMALL" });
         continue;
       }
-      const target = { name, color: g.color, members };
+      const target = { name, color: g.color, position: g.position, members };
       for (const t of members) claimed.set(t.id, target);
       targets.push(target);
     }
@@ -551,7 +607,9 @@
       }
       if (!claiming.size && !ungroupedLeaving) continue; // untouched by the plan
       const named = s.name ? targets.find((t) => t.name && t.name === s.name) : null;
-      const continuation = named || (!ungroupedLeaving && claiming.size === 1 ? [...claiming][0] : null);
+      // A single claiming target continues the stack only when it does not rename it: an explicit different name means the members leave (stack dissolves, the target recreates it), an unnamed target keeps the existing title.
+      const sole = claiming.size === 1 ? [...claiming][0] : null;
+      const continuation = named || (!ungroupedLeaving && sole && (!sole.name || sole.name === s.name) ? sole : null);
       const kept = s.tabIds.filter((id) => {
         if (ungroupedSet.has(id)) return false;
         const t = claimed.get(id);
@@ -573,9 +631,12 @@
     // leftward within their own member set) cannot disturb it. groupTabs recreates the
     // group with a fresh ext id — TidyTabs' addTabs behavior — and its clean-slate audit
     // dissolves whatever single old group the members still share.
+    // Left-to-right by anchor position minimizes interference between pre-passes (best-effort, not an absolute guarantee). Sorted against a fresh snapshot — Phase 1 may have moved tabs.
+    const freshOrder = await queryTabs();
+    const posOf = new Map(freshOrder.map((t) => [t.id, t.index]));
     targets.sort((a, b) => {
-      const ia = Math.min(...a.members.map((m) => byId.get(m.id)?.index ?? Infinity));
-      const ib = Math.min(...b.members.map((m) => byId.get(m.id)?.index ?? Infinity));
+      const ia = Math.min(...a.members.map((m) => posOf.get(m.id) ?? Infinity));
+      const ib = Math.min(...b.members.map((m) => posOf.get(m.id) ?? Infinity));
       return ia - ib;
     });
     const applied = [];
@@ -594,7 +655,12 @@
         const sameMembers = !!stack && stack.tabIds.length === memberTabs.length && stack.tabIds.every((id) => memberTabs.some((m) => m.id === id));
         const titleOk = !t.name || (anchor && parseViv(anchor).fixedGroupTitle === t.name);
         const colorOk = !t.color || (anchor && parseViv(anchor).groupColor === t.color);
-        if (sameMembers && titleOk && colorOk) {
+        const posOk = t.position !== "end" || (() => {
+          const memberIdx = memberTabs.map((m) => m.index);
+          const otherIdx = fresh.filter((x) => !memberTabs.some((m) => m.id === x.id)).map((x) => x.index);
+          return memberIdx.length > 0 && (otherIdx.length === 0 || Math.min(...memberIdx) > Math.max(...otherIdx));
+        })();
+        if (sameMembers && titleOk && colorOk && posOk) {
           applied.push({ name: t.name || null, groupExtId: gid, tabIds: memberTabs.map((m) => m.id), unchanged: true });
           unchanged = true;
         }
@@ -603,6 +669,15 @@
         const res = await groupTabs(memberTabs, { name: t.name, color: t.color });
         applied.push({ name: t.name || null, groupExtId: res.groupExtId, tabIds: memberTabs.map((m) => m.id) });
       }
+    }
+
+    // Phase 3 — positional pass: groups marked position:"end" are walked to the strip tail in declaration order, under the same mutation lock; moving to the tail in member order preserves relative order within the group.
+    for (const t of targets.filter((x) => x.position === "end")) {
+      for (const m of t.members) {
+        const snap = await queryTabs();
+        await moveTabRace(m.id, snap.length);
+      }
+      await wait(MOVE_SETTLE_MS);
     }
 
     layoutRev += 1;
