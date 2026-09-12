@@ -174,7 +174,7 @@ Create a native stack from 2+ tabs.
 | `name` | `string` | no | ≤ 50 chars (truncated); omitted = unnamed stack |
 | `color` | `string` | no | Native stack color, requires `groupColor` capability |
 
-Returns `{ "groupExtId": "..." }`. Errors: `TOO_FEW_TABS`, `PINNED_TABS`, `UNSUPPORTED_API`.
+Returns `{ "groupExtId": "..." }`. Errors: `TOO_FEW_TABS`, `PINNED_TABS`, `GROUPED_TABS`, `UNSUPPORTED_API`. Member order follows the tab strip; if every member already belongs to one stack, that stack is dissolved first (clean slate), and members spanning multiple stacks are rejected with `GROUPED_TABS`.
 
 #### `stacks.addTabs`
 
@@ -221,6 +221,36 @@ Pin or unpin every member of a stack. Param: `{ stackId: string, pinned?: boolea
 
 #### `events.unsubscribe` → `{ "subscribed": false }`
 
+## 4b. Protocol v2 — declarative layout (`v: 2` envelopes)
+
+Protocol 2 is additive: every v1 action remains fully served on v1 envelopes, `bridge.capabilities` reports `"protocol": 2, "versions": [1, 2]`, and responses echo the request's `v`.
+
+### `layout.apply` → `{ rev, applied: [{ name, groupExtId, tabIds, unchanged? }], dissolved: [groupId], skipped: [{ tabId? | group?, reason }] }`
+
+The external extension declares the **entire desired end-state**; the bridge computes the diff against one snapshot and orchestrates everything in a single locked pass — the shape of TidyTabs' one-shot Tidy flow.
+
+```jsonc
+// request params
+{
+  "groups": [
+    { "name": "V2EX", "color": "color1", "tabIds": [101, 102] },
+    { "tabIds": [103, 104] }            // name/color optional
+  ],
+  "ungrouped": [105]                     // optional: tabs that must end up unstacked
+}
+```
+
+Orchestration (all under one mutation lock and watchdog):
+
+1. **Plan** — one snapshot; unresolvable/pinned/duplicate/over-claimed tabs are reported in `skipped` (reasons: `NOT_IN_WINDOW`, `PINNED`, `ALREADY_CLAIMED`, `GROUP_TOO_SMALL`) instead of failing the call.
+2. **Reconcile existing stacks** (TidyTabs' dismantle step) — stacks losing members to a target or to `ungrouped` are rebuilt with the remainder (full pipeline, title preserved) or dissolved when they drop below two members.
+3. **Realize targets left-to-right** by anchor position — strip-order adjacency pre-pass → native move with contiguous strip-ordered ids → settle → `setGroupProperties` → per-member tree metadata. Members already in one stack get a fresh group ext id (TidyTabs' addTabs behavior) with the clean-slate audit dissolving the old group.
+4. **Idempotency** — a target whose members already sit together in one stack under the requested title/color is reported with `"unchanged": true` and left untouched. Re-sending the same layout is a no-op; after any partial failure, re-sending it converges (self-healing).
+
+`rev` increments per successful apply (per mod session). Errors: `BAD_PARAMS`, `GROUPED_TABS` (unreachable in practice — phase 1 dissolves conflicts first), `UNSUPPORTED_API`, watchdog errors.
+
+v1 clients are unaffected; `layout.apply` on a `v: 1` envelope returns `WRONG_VERSION`.
+
 ## 5. Error codes
 
 | Code | Meaning | Typical recovery |
@@ -231,6 +261,8 @@ Pin or unpin every member of a stack. Param: `{ stackId: string, pinned?: boolea
 | `TOO_FEW_TABS` | < 2 valid tabs for a stack operation | Ensure tabs exist and are valid |
 | `PINNED_TABS` | Operation would mix pinned/unpinned members | Unpin or split the operation |
 | `NO_SUCH_STACK` | `stackId` matches no tabs | Refresh state, re-query `stacks.list` |
+| `GROUPED_TABS` | `stacks.create` members span more than one existing stack | Unstack the stacks or move members via `stacks.removeTabs` first, then create |
+| `WRONG_VERSION` | v2-only action called on a v1 envelope | Send the request with `"v": 2` |
 | `BUSY` | Another mutation in flight | Retry after a short delay |
 | `STACKING_FAILED` | `tabsPrivate.move` returned no group id | Check capabilities; report upstream |
 | `NATIVE_TIMEOUT` | A private Vivaldi API call never responded (10 s watchdog) | Retry once; if it repeats, report the Vivaldi version |
@@ -243,7 +275,7 @@ Note: `BRIDGE_TIMEOUT` and `BAD_RESPONSE` come from the client helper (§2.2), n
 
 - **UI updates are automatic.** Writes go through Vivaldi's native write path; the tab bar re-renders on its own. Never try to notify the UI yourself.
 - **Mutations are serialized.** Concurrent write requests get `BUSY`. Read actions are never blocked.
-- **Scattered tabs are fine.** The native group move makes members contiguous in the order given in `tabIds`; there is no separate adjacency pass and `tabIds` order is preserved.
+- **Member order follows the tab strip, not `tabIds` order.** `tabIds` selects WHICH tabs are grouped; the resulting group order is their current strip order (TidyTabs/Vivaldi-UI-aligned). Tabs are pre-placed contiguously in strip order before the native group move, so the move never reorders inside the contiguous run — the native flow the Vivaldi UI itself exercises. Sort `tabIds` before sending if the caller needs to know the resulting order.
 - **Names are capped at 50 characters** (Vivaldi's own limit for fixed titles); longer names are silently truncated.
 - **Stack state is window-scoped in v1.** Omitting `windowId` operates on the current window.
 - **Uninstall safety.** `bridge.sh uninstall` removes only the bridge mod. Stack state (`vivExtData`) is part of tab metadata and survives; the native stacks remain fully functional without the mod.

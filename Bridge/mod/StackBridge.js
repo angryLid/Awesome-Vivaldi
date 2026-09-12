@@ -24,12 +24,15 @@
   "use strict";
 
   const LOG = "[StackBridge]";
-  const MOD_VERSION = "2026.9.12-r4"; // runtime build identity (date segment matches @version)
-  const PROTOCOL_VERSION = 1;
+  const MOD_VERSION = "2026.9.12-r8"; // runtime build identity (date segment matches @version)
+  const PROTOCOL_VERSION = 2;
+  const PROTOCOL_VERSIONS = [1, 2]; // v1 actions stay fully served; v2 adds layout.apply
   const EVENT_DEBOUNCE_MS = 150;
   const MAX_NAME_LEN = 50; // Vivaldi caps fixed titles at 50 chars (PageActions.setFixedTitle)
   const MAX_TABS_PER_CALL = 200;
   const MOVE_SETTLE_MS = 100; // settle between structural moves and metadata reads (mirrors TidyTabs)
+  const MUTATION_PACE_MS = 50; // pause between per-member metadata writes (mirrors TidyTabs)
+  const MOVE_CB_RACE_MS = 500; // chrome.tabs.move callback is untrusted — race it with a timeout
 
   // Two-level logging: DEBUG traces requests/responses/event fan-out, ERROR reports failures and always prints; the dev build ships with DEBUG on.
   const LEVELS = { DEBUG: 10, ERROR: 20 };
@@ -144,12 +147,13 @@
 
   // ── stack mutations (write path — recipes lifted from Vivaldi PageActions) ──
 
-  // The one and only write step: the native group move also pulls scattered members into a
-  // contiguous run in the order given — exactly what PageActions.createTabStack relies on when
-  // stacking a scattered multi-selection. There is NO chrome.tabs.move adjacency pre-pass:
-  // its reorder DOES execute in the window.html context, but callback delivery is unreliable
-  // (observed on a real 8.x install: tabs moved while the awaited callback never fired,
-  // wedging the mutation), and Vivaldi's own UI never awaits it for reordering anyway.
+  // The group move step. Since r6 the members are pre-placed in strip order, so
+  // rebuildGroup always receives a contiguous run in the order the strip already has —
+  // the exact input shape Vivaldi's own UI and TidyTabs produce, with no internal
+  // reordering under do-not-reparent.
+  // chrome.tabs.move still executes its reorder even when its callback is dropped
+  // (observed on a real 8.x install), which is why the pre-pass races the callback instead
+  // of awaiting it bare.
   const rebuildGroup = async (tabIds, targetTabId) => {
     logDebug(`tabsPrivate.move: grouping ${tabIds.length} tabs onto target ${targetTabId}`);
     const res = await callPrivate(tp().move.bind(tp()), {
@@ -175,6 +179,48 @@
     await callPrivate(tp().setGroupProperties.bind(tp()), { groupExtId: String(groupId), groupColor: color }, "tabsPrivate.setGroupProperties");
   };
 
+  // One adjacency move step. chrome.tabs.move executes its reorder even when its callback is
+  // dropped, so the callback is raced against a timeout instead of being trusted — TidyTabs
+  // awaits the callback bare and would hang forever on a dropped one (same latent race that
+  // wedged our r1 mutation).
+  const moveTabRace = (tabId, index) =>
+    new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try { chrome.tabs.move(tabId, { index }, () => { void chrome.runtime.lastError; finish(); }); }
+      catch { return finish(); }
+      setTimeout(finish, MOVE_CB_RACE_MS);
+    });
+
+  // Adjacency pre-pass — TidyTabs-exact: members are placed at base+i in STRIP order (sorted
+  // by current index), so every move is leftward and the single pass converges. Feeding the
+  // native move a caller-scrambled order instead forces rightward moves that disrupt already
+  // placed members (pass 1 never converged on a real install) and, worse, a contiguous but
+  // non-strip-order input that makes tabsPrivate.move reorder INSIDE the run with
+  // do-not-reparent suppressing tree updates — a native path Vivaldi's own UI never
+  // exercises, and the latent tree corruption behind the delayed stack desync. Group member
+  // order therefore follows the strip, matching what TidyTabs produces. Contiguity is
+  // verified through the trusted read path (chrome.tabs.query) and retried once; correctness
+  // never depends on move callbacks. Returns the members in strip order.
+  const makeAdjacent = async (orderedTabs) => {
+    const byStrip = [...orderedTabs].sort((a, b) => a.index - b.index);
+    for (let pass = 1; pass <= 2; pass++) {
+      const before = await queryTabs();
+      const base = before.find((t) => t.id === byStrip[0].id)?.index ?? 0;
+      for (let i = 0; i < byStrip.length; i++) await moveTabRace(byStrip[i].id, base + i);
+      await wait(MOVE_SETTLE_MS);
+      const after = await queryTabs();
+      const idx = new Map(after.map((t) => [t.id, t.index]));
+      if (byStrip.every((t, i) => idx.get(t.id) === base + i)) {
+        logDebug(`adjacency pass ${pass}: members contiguous at indexes ${base}..${base + byStrip.length - 1} (strip order)`);
+        return byStrip;
+      }
+      logDebug(`adjacency pass ${pass}: members not contiguous yet, retrying`);
+    }
+    logDebug("adjacency: verification inconclusive, proceeding with the native move anyway");
+    return byStrip;
+  };
+
   // Serial, awaited vivExtData touch-up for one tab: read fresh, apply mutate, write back only
   // when something actually differs. chrome.tabs.get/update callbacks ARE reliable in the
   // window.html context — only chrome.tabs.move's callback proved untrustworthy — and TidyTabs
@@ -193,29 +239,80 @@
       });
     });
 
-  // Post-move metadata refresh — serial and awaited, one tab at a time. This used to be
-  // concurrent fire-and-forget (r3) and that raced Vivaldi's own post-move vivExtData commit:
-  // stale get() snapshots were written back over fresh native data, desyncing member metadata
-  // from the UI model — first click inside the stack jumped and reverted, and a tab could
-  // escape its group. TidyTabs avoids the bug by strictly serializing the same writes.
-  const writeGroupMeta = async (tabIds, groupId, name) => {
-    for (const tabId of tabIds) {
-      await updateTabMeta(tabId, (v) => {
-        v.group = String(groupId);
-        if (name) v.fixedGroupTitle = name;
+  // TidyTabs-exact metadata write: unconditional update followed by a verification read.
+  // Safe here because the choreography already settled after the structural moves and paces
+  // one write at a time — the same conditions under which TidyTabs has run for years.
+  const updateTabProps = (tabId, viv) =>
+    new Promise((resolve) => {
+      chrome.tabs.update(tabId, { vivExtData: JSON.stringify(viv) }, () => {
+        void chrome.runtime.lastError;
+        chrome.tabs.get(tabId, () => resolve());
       });
+    });
+
+  // Per-member metadata — aligned with TidyTabs' addTabToStack. Vivaldi's tab model is a
+  // TREE keyed by vivExtData.ext_id / parent_ext_id: the first member is the root
+  // (parent_ext_id null) and every other member points at the root's ext_id. Earlier
+  // builds skipped the tree fields and relied on the native move having built the tree —
+  // correct at first, but the scattered-input tree carried latent inconsistency that
+  // Vivaldi normalized later (activation reordering, session sync), and the desync only
+  // then surfaced: first click inside the stack jumped and reverted, and a tab could
+  // escape its group. Rewriting the chain explicitly (plus 50 ms pacing between writes)
+  // establishes the same self-consistent final state TidyTabs produces.
+  const writeGroupMeta = async (tabIds, groupId, name, color) => {
+    let rootExtId = null;
+    for (let i = 0; i < tabIds.length; i++) {
+      const tabId = tabIds[i];
+      const v = await new Promise((resolve) => {
+        chrome.tabs.get(tabId, (tab) => {
+          if (chrome.runtime.lastError || !tab) return resolve(null);
+          try { resolve(typeof tab.vivExtData === "string" ? JSON.parse(tab.vivExtData) : (tab.vivExtData || {})); }
+          catch { resolve({}); }
+        });
+      });
+      if (!v) continue;
+      const extId = v.ext_id || crypto.randomUUID(); // preserve native ext_id, generate only if missing
+      v.ext_id = extId;
+      v.group = String(groupId);
+      v.tidyStackOwner = "StackBridge";
+      v.tidyStackId = String(groupId);
+      if (name) v.fixedGroupTitle = name;
+      if (color) v.groupColor = color;
+      v.parent_ext_id = i === 0 ? null : rootExtId;
+      if (i === 0) rootExtId = extId;
+      logDebug(`vivExtData: writing tab ${tabId} (parent_ext_id=${String(v.parent_ext_id)})`);
+      await updateTabProps(tabId, v);
+      if (i < tabIds.length - 1) await wait(MUTATION_PACE_MS);
     }
   };
 
-  // Shared mutation choreography: native group → settle → title/color → serial metadata refresh.
+  // Shared mutation choreography — fully aligned with TidyTabs.createTabStacks: strip-order
+  // adjacency pre-pass (single converging pass) → native group move receives strip-ordered
+  // contiguous ids (no internal reordering) → settle → title/color → per-member tree
+  // metadata written sequentially with pacing.
   const groupTabs = async (orderedTabs, { name, color }) => {
-    const ids = orderedTabs.map((t) => t.id);
+    // Clean-slate invariant (TidyTabs-aligned): TidyTabs never runs create-new-group over
+    // tabs still registered in another stack — it dismantles unnamed stacks first and
+    // excludes named-stack members from its pool. Create-new-group over model-registered
+    // members of another group is a native path nothing in Vivaldi exercises (tree updates
+    // suppressed by do-not-reparent), and the resulting dual membership is what gets
+    // normalized later — surfacing as delayed first-click desyncs and members escaping to
+    // other groups. Dissolve a single shared old group automatically; refuse on mixed ones.
+    const oldGroups = [...new Set(orderedTabs.map((t) => String(parseViv(t).group || "")).filter(Boolean))];
+    if (oldGroups.length === 1) {
+      logDebug(`stack mutation: members belong to stack ${oldGroups[0]} — dissolving it first (clean slate)`);
+      await dissolveStack(oldGroups[0]);
+    } else if (oldGroups.length > 1) {
+      throw err("GROUPED_TABS", `Members span ${oldGroups.length} existing stacks — unstack or removeTabs them first`);
+    }
+    const strip = await makeAdjacent(orderedTabs);
+    const ids = strip.map((t) => t.id);
     const groupId = await rebuildGroup(ids, ids[0]);
     // Let Vivaldi finish its own post-move vivExtData commit before we read anything back.
     await wait(MOVE_SETTLE_MS);
     await setGroupTitle(groupId, name);
     await setGroupColor(groupId, color);
-    await writeGroupMeta(ids, groupId, name);
+    await writeGroupMeta(ids, groupId, name, color);
     return { groupExtId: groupId };
   };
 
@@ -346,6 +443,7 @@
   function capabilities() {
     return {
       protocol: PROTOCOL_VERSION,
+      versions: PROTOCOL_VERSIONS,
       nativeStacking: hasPrivate(),
       groupTitle: hasSetGroupProperties(),
       groupColor: hasSetGroupProperties(),
@@ -356,6 +454,7 @@
         "tabs.list", "stacks.list",
         "stacks.create", "stacks.addTabs", "stacks.removeTabs",
         "stacks.rename", "stacks.setColor", "stacks.unstack", "stacks.pin",
+        "layout.apply",
         "events.subscribe", "events.unsubscribe",
       ].filter((a) => {
         if (a.startsWith("stacks.") && a !== "stacks.list") return hasPrivate();
@@ -377,6 +476,139 @@
 
   // ── request dispatch ───────────────────────────────────────────────────
 
+  // ── protocol v2: layout.apply — declarative end-state, TidyTabs-shaped orchestration ──
+
+  // The external extension declares the WHOLE desired layout (groups with members and
+  // optional title/color, plus tabs that must end up unstacked); the bridge computes the
+  // diff against one snapshot and orchestrates everything in a single locked pass — the
+  // same shape as TidyTabs' one-shot Tidy flow, which is where its stability comes from.
+  // Idempotent: re-sending the same layout is a no-op. Self-healing: after any partial
+  // failure, re-sending the same layout converges to it.
+  let layoutRev = 0; // monotonic per mod session; lets callers detect divergent layouts
+  const LAYOUT_MAX_GROUPS = 50;
+
+  const applyLayout = async ({ groups, ungrouped } = {}) => {
+    if (!hasPrivate()) throw err("UNSUPPORTED_API", "tabsPrivate.move unavailable — native stacking not possible");
+    if (!Array.isArray(groups)) throw err("BAD_PARAMS", "groups must be an array");
+    if (groups.length > LAYOUT_MAX_GROUPS) throw err("BAD_PARAMS", `groups exceeds ${LAYOUT_MAX_GROUPS}`);
+    if (ungrouped !== undefined && !Array.isArray(ungrouped)) throw err("BAD_PARAMS", "ungrouped must be an array");
+
+    // Phase 0 — one consistent snapshot; resolve and de-conflict the whole plan before
+    // touching anything. Unresolvable/pinned/over-claimed tabs are reported, not fatal —
+    // TidyTabs skips unsuitable tabs the same way.
+    const tabs = await queryTabs();
+    const byId = new Map(tabs.map((t) => [t.id, t]));
+    const skipped = [];
+    const claimed = new Map(); // tabId → target
+    const resolveTab = (id) => {
+      const t = byId.get(Number(id));
+      if (!t) { skipped.push({ tabId: id, reason: "NOT_IN_WINDOW" }); return null; }
+      if (t.pinned) { skipped.push({ tabId: id, reason: "PINNED" }); return null; }
+      if (claimed.has(t.id)) { skipped.push({ tabId: t.id, reason: "ALREADY_CLAIMED" }); return null; }
+      return t;
+    };
+    const targets = [];
+    for (const g of groups) {
+      if (!g || !Array.isArray(g.tabIds)) throw err("BAD_PARAMS", "each group needs a tabIds array");
+      const name = clampName(g.name);
+      const members = [];
+      for (const id of g.tabIds) {
+        const t = resolveTab(id);
+        if (t) { members.push(t); claimed.set(t.id, null); }
+      }
+      if (members.length < 2) {
+        for (const t of members) { claimed.delete(t.id); skipped.push({ tabId: t.id, reason: "GROUP_TOO_SMALL" }); }
+        skipped.push({ group: name || null, reason: "GROUP_TOO_SMALL" });
+        continue;
+      }
+      const target = { name, color: g.color, members };
+      for (const t of members) claimed.set(t.id, target);
+      targets.push(target);
+    }
+    const ungroupedSet = new Set();
+    for (const id of Array.isArray(ungrouped) ? ungrouped : []) {
+      const t = resolveTab(id);
+      if (t) ungroupedSet.add(t.id);
+    }
+
+    const existing = buildStacks(tabs); // inventory from the same snapshot
+    const dissolved = [];
+
+    // Phase 1 — reconcile every existing stack touched by the plan (TidyTabs' dismantle
+    // step). A stack CONTINUES when its members are claimed by one matching target — same
+    // fixedGroupTitle, or a single target when the stack has no title (its identity is
+    // memberhood). Members claimed by any other target or by `ungrouped` leave, and the
+    // remainder keep the stack — rebuilt via the full pipeline if it still holds two or
+    // more, dissolved otherwise. Getting this rule wrong dissolves stacks their own layout
+    // asked to keep (caught by the idempotent re-apply harness scenario).
+    for (const s of existing) {
+      const claiming = new Set();
+      let ungroupedLeaving = false;
+      for (const id of s.tabIds) {
+        if (ungroupedSet.has(id)) ungroupedLeaving = true;
+        const t = claimed.get(id);
+        if (t) claiming.add(t);
+      }
+      if (!claiming.size && !ungroupedLeaving) continue; // untouched by the plan
+      const named = s.name ? targets.find((t) => t.name && t.name === s.name) : null;
+      const continuation = named || (!ungroupedLeaving && claiming.size === 1 ? [...claiming][0] : null);
+      const kept = s.tabIds.filter((id) => {
+        if (ungroupedSet.has(id)) return false;
+        const t = claimed.get(id);
+        return !t || t === continuation;
+      });
+      if (kept.length === s.tabIds.length) continue; // nothing leaves after all
+      if (kept.length >= 2) {
+        logDebug(`layout.apply: rebuilding stack ${String(s.id).slice(0, 8)} with ${kept.length} remaining member(s)`);
+        await groupTabs(kept.map((id) => byId.get(id)).filter(Boolean), { name: s.name || undefined });
+      } else {
+        logDebug(`layout.apply: dissolving stack ${String(s.id).slice(0, 8)} (drops below two members)`);
+        await dissolveStack(s.id);
+        dissolved.push(String(s.id));
+      }
+    }
+
+    // Phase 2 — realize each target group, left-to-right by anchor position: the left group
+    // is contiguous before the right one starts, so later pre-passes (whose moves are all
+    // leftward within their own member set) cannot disturb it. groupTabs recreates the
+    // group with a fresh ext id — TidyTabs' addTabs behavior — and its clean-slate audit
+    // dissolves whatever single old group the members still share.
+    targets.sort((a, b) => {
+      const ia = Math.min(...a.members.map((m) => byId.get(m.id)?.index ?? Infinity));
+      const ib = Math.min(...b.members.map((m) => byId.get(m.id)?.index ?? Infinity));
+      return ia - ib;
+    });
+    const applied = [];
+    for (const t of targets) {
+      // Idempotency check against fresh state: a stack already holding exactly these
+      // members under the requested title/color is left untouched.
+      const fresh = await queryTabs();
+      const freshById = new Map(fresh.map((x) => [x.id, x]));
+      const memberTabs = t.members.map((m) => freshById.get(m.id)).filter(Boolean);
+      const groupIds = new Set(memberTabs.map((m) => String(parseViv(m).group || "")));
+      let unchanged = false;
+      if (groupIds.size === 1) {
+        const gid = [...groupIds][0];
+        const stack = existing.find((s) => String(s.id) === gid);
+        const anchor = memberTabs.find((m) => String(parseViv(m).group) === gid);
+        const sameMembers = !!stack && stack.tabIds.length === memberTabs.length && stack.tabIds.every((id) => memberTabs.some((m) => m.id === id));
+        const titleOk = !t.name || (anchor && parseViv(anchor).fixedGroupTitle === t.name);
+        const colorOk = !t.color || (anchor && parseViv(anchor).groupColor === t.color);
+        if (sameMembers && titleOk && colorOk) {
+          applied.push({ name: t.name || null, groupExtId: gid, tabIds: memberTabs.map((m) => m.id), unchanged: true });
+          unchanged = true;
+        }
+      }
+      if (!unchanged) {
+        const res = await groupTabs(memberTabs, { name: t.name, color: t.color });
+        applied.push({ name: t.name || null, groupExtId: res.groupExtId, tabIds: memberTabs.map((m) => m.id) });
+      }
+    }
+
+    layoutRev += 1;
+    return { rev: layoutRev, applied, dissolved, skipped };
+  };
+
   const HANDLERS = {
     "bridge.ping": async () => ({ pong: true, protocol: PROTOCOL_VERSION }),
     "bridge.capabilities": async () => capabilities(),
@@ -389,17 +621,18 @@
     "stacks.setColor": (p) => withLock(() => colorStack(p)),
     "stacks.unstack": (p) => withLock(() => unstackStack(p)),
     "stacks.pin": (p) => withLock(() => pinStack(p)),
+    "layout.apply": (p) => withLock(() => applyLayout(p)),
   };
 
   const subscribers = new Set(); // extIds that asked for events
 
-  const reply = (sendResponse, id, ok, payload) => {
-    try { sendResponse({ v: PROTOCOL_VERSION, id, type: "response", ok, ...payload }); }
+  const reply = (sendResponse, id, ok, payload, v) => {
+    try { sendResponse({ v: v ?? PROTOCOL_VERSION, id, type: "response", ok, ...payload }); }
     catch { /* port closed before response — nothing to do */ }
   };
 
   chrome.runtime.onMessageExternal.addListener((env, sender, sendResponse) => {
-    if (!env || env.v !== PROTOCOL_VERSION) return; // not ours — stay silent for foreign traffic
+    if (!env || !PROTOCOL_VERSIONS.includes(env.v)) return; // not ours — stay silent for foreign traffic
 
     if (env.type !== "request") return;
     // AUTH-CHECK: pairing enforcement was removed for the dev build. When the
@@ -411,20 +644,24 @@
     if (env.action === "events.subscribe") {
       subscribers.add(extId);
       logDebug(`events.subscribe from ${extId} (${subscribers.size} subscribed)`);
-      reply(sendResponse, env.id, true, { result: { subscribed: true, capabilities: capabilities() } });
+      reply(sendResponse, env.id, true, { result: { subscribed: true, capabilities: capabilities() } }, env.v);
       return;
     }
     if (env.action === "events.unsubscribe") {
       subscribers.delete(extId);
       logDebug(`events.unsubscribe from ${extId} (${subscribers.size} subscribed)`);
-      reply(sendResponse, env.id, true, { result: { subscribed: false } });
+      reply(sendResponse, env.id, true, { result: { subscribed: false } }, env.v);
       return;
     }
 
     const handler = HANDLERS[env.action];
     if (!handler) {
       logError(`UNKNOWN_ACTION "${env.action}" from ${extId}`);
-      reply(sendResponse, env.id, false, { error: { code: "UNKNOWN_ACTION", message: `Unknown action: ${env.action}` } });
+      reply(sendResponse, env.id, false, { error: { code: "UNKNOWN_ACTION", message: `Unknown action: ${env.action}` } }, env.v);
+      return;
+    }
+    if (env.action === "layout.apply" && env.v !== 2) {
+      reply(sendResponse, env.id, false, { error: { code: "WRONG_VERSION", message: "layout.apply requires protocol v2" } }, env.v);
       return;
     }
 
@@ -433,11 +670,11 @@
       .then(() => handler(env.params || {}))
       .then((result) => {
         logDebug(`← ok ${env.action} (${Date.now() - startedAt}ms) ${short(result)}`);
-        reply(sendResponse, env.id, true, { result });
+        reply(sendResponse, env.id, true, { result }, env.v);
       })
       .catch((e) => {
         logError(`← ${env.action} failed (${e.code || "INTERNAL"}, ${Date.now() - startedAt}ms): ${e.message || e}`, e);
-        reply(sendResponse, env.id, false, { error: { code: e.code || "INTERNAL", message: String(e.message || e) } });
+        reply(sendResponse, env.id, false, { error: { code: e.code || "INTERNAL", message: String(e.message || e) } }, env.v);
       });
     return true; // keep sendResponse alive across the async work
   });
