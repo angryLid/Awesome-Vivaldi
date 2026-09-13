@@ -43,6 +43,8 @@ Usage:
 Options:
   --path <dir>            Target an explicit Vivaldi resources/vivaldi directory
   -y                      Non-interactive: apply to all discovered installations
+
+Confirmation prompts: Enter = yes, Esc = no.
 EOF
 }
 
@@ -180,31 +182,45 @@ launch_vivaldi() {
   esac
 }
 
+# Single-key confirm: Enter = yes, Esc = no. Other keys are ignored; EOF or a
+# non-interactive stdin answers "no". With -y it answers yes without prompting.
+ask_yn() {
+  local prompt="$1" key=""
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  if [ ! -t 0 ]; then printf '  %s (no tty — answering No)\n' "$prompt"; return 1; fi
+  printf '  %s %b[Enter]%b=Yes  %b[Esc]%b=No ' "$prompt" "$C_G" "$C_B" "$C_R" "$C_B"
+  while IFS= read -rsn1 key; do
+    case "$key" in
+      "")    echo; return 0 ;;
+      $'\e') echo; return 1 ;;
+    esac
+  done
+  echo
+  return 1
+}
+
 # Ask (or with -y, assume yes) to restart Vivaldi after a successful apply.
 offer_restart() {
   if [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" != "Darwin" ] && [ -z "${SUDO_USER:-}" ]; then
     log "Running as root — restart Vivaldi manually from your user session."
     return 0
   fi
-  local ans=""
   if is_running; then
-    if [ "$ASSUME_YES" -eq 1 ]; then ans="y"; else printf "Restart Vivaldi now? [y/N] "; read -r ans; fi
-    case "$ans" in y|Y|yes|Yes)
+    if ask_yn "Restart Vivaldi now?"; then
       echo "  Restarting Vivaldi..."
       stop_vivaldi
       launch_vivaldi
       log "Vivaldi restarted."
-      ;;
-    *) log "Skipped — restart Vivaldi to apply." ;;
-    esac
+    else
+      log "Skipped — restart Vivaldi to apply."
+    fi
   else
-    if [ "$ASSUME_YES" -eq 1 ]; then ans="y"; else printf "Vivaldi is not running. Launch it now? [y/N] "; read -r ans; fi
-    case "$ans" in y|Y|yes|Yes)
+    if ask_yn "Vivaldi is not running. Launch it now?"; then
       launch_vivaldi
       log "Vivaldi launched."
-      ;;
-    *) log "Skipped — launch Vivaldi to apply." ;;
-    esac
+    else
+      log "Skipped — launch Vivaldi to apply."
+    fi
   fi
 }
 
@@ -329,10 +345,8 @@ done
 [ -z "$CMD" ] && { usage; die "No command given"; }
 
 echo "StackBridge installer ($CMD)"
-if [ "$ASSUME_YES" -ne 1 ] && [ "$CMD" != "status" ]; then
-  printf "Continue? [y/N] "
-  read -r ans
-  case "$ans" in y|Y|yes|Yes) ;; *) echo "Aborted."; exit 0 ;; esac
+if [ "$CMD" != "status" ]; then
+  ask_yn "Continue?" || { echo "Aborted."; exit 0; }
 fi
 
 "cmd_$CMD"
