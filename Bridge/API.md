@@ -31,16 +31,11 @@ Planned behavior: the first request from an unpaired extension returns:
 { "ok": false, "error": { "code": "NOT_PAIRED", "message": "Extension not paired. Run StackBridge.pair(id) in window.html console." } }
 ```
 
-To pair, the user opens the window.html DevTools console (`vivaldi:inspect` → inspect `window.html`) and runs:
+Pairing commands (console side, currently **no-ops** — they log a DEBUG notice and change nothing, so client code that handles `NOT_PAIRED` will simply never see it yet):
 
 ```js
-StackBridge.pair("<your-extension-id>")  // 32 chars, alphabet a–p
-StackBridge.list()                       // show paired ids
-StackBridge.unpair("<id>")               // revoke (omit arg = revoke all)
-StackBridge.capabilities()               // inspect from the console side
+StackBridge.pair("<your-extension-id>")
 ```
-
-In the current build these commands exist but are **no-ops** (they log a DEBUG notice and change nothing) — client code that handles `NOT_PAIRED` will simply never see it yet.
 
 ### 1.3 Capability discovery
 
@@ -254,7 +249,7 @@ Orchestration (all under one mutation lock and watchdog):
 4. **Idempotency** — a target whose members already sit together in one stack under the requested title/color (and at the strip tail when `position: "end"`) is reported with `"unchanged": true` and left untouched. Re-sending the same layout is a no-op; after any partial failure, re-sending it converges (self-healing).
 5. **Positional pass** — groups marked `"position": "end"` are walked to the strip tail in declaration order, inside the mutation lock; no client-side strip mutation is ever needed.
 
-`rev` increments per successful apply (per mod session). Errors: `BAD_PARAMS`, `NAMED_STACK_CONFLICT` (a plan target renames a named stack its members still belong to — Phase 1 dissolves such stacks first, so this is unreachable in practice), `ADJACENCY_FAILED`, `UNSUPPORTED_API`, watchdog errors.
+`rev` increments per successful apply (per mod session). Errors: `BAD_PARAMS`, `NAMED_STACK_CONFLICT` (a plan target renames a named stack its members still belong to — unreachable in practice, since Phase 1 dissolves such stacks first), `ADJACENCY_FAILED`, `UNSUPPORTED_API`, watchdog errors.
 
 v1 clients are unaffected; `layout.apply` on a `v: 1` envelope returns `WRONG_VERSION`.
 
@@ -277,6 +272,7 @@ v1 clients are unaffected; `layout.apply` on a `v: 1` envelope returns `WRONG_VE
 | `CROSS_WORKSPACE` | Tabs belong to a different workspace than the target stack / current workspace | Scope the operation to one workspace |
 | `NATIVE_TIMEOUT` | A private Vivaldi API call never responded (10 s watchdog) | Retry once; if it repeats, report the Vivaldi version |
 | `MUTATION_TIMEOUT` | A stack mutation exceeded the 30 s overall bound (watchdog) | Retry once; if it repeats, report the Vivaldi version and the console log |
+| `UNKNOWN_ACTION` | Action name not recognized by this build | Check `bridge.capabilities().actions`; upgrade the mod if the action is newer |
 | `INTERNAL` | Unexpected error | See `message`; window.html console has details |
 
 Note: `BRIDGE_TIMEOUT` and `BAD_RESPONSE` come from the client helper (§2.2), not the bridge.
